@@ -10,10 +10,20 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 
+
+#include <assert.h>
+#include <math.h>
+
 #define MAX_KERNEL_RADIUS 9
 #define NUM_KERNELS MAX_KERNEL_RADIUS
 #define KERNEL_LENGTH(x) (2 * x + 1)
 #define MAX_KERNEL_LENGTH KERNEL_LENGTH(MAX_KERNEL_RADIUS)
+
+#define ROW_TILE_WIDTH 32
+#define ROW_TILE_HEIGHT 4
+#define ROW_TILES_IN_BLOCK 20
+#define ROW_BLOCK_WIDTH ROW_TILES_IN_BLOCK * ROW_TILE_WIDTH
+#define ROW_BLOCK_HEIGHT ROW_TILE_HEIGHT
 
 __constant__ float c_kernel[NUM_KERNELS * (NUM_KERNELS + 2)];
 
@@ -67,35 +77,20 @@ __global__ void depth(const cv::cuda::PtrStepSzf src, cv::cuda::PtrStepSzf dst, 
 }
 
 
-#define ROW_TILE_WIDTH 32
-#define ROW_TILE_HEIGHT 4
-#define ROW_TILES_IN_BLOCK 20
-#define ROW_BLOCK_WIDTH ROW_TILES_IN_BLOCK * ROW_TILE_WIDTH
-#define ROW_BLOCK_HEIGHT ROW_TILE_HEIGHT
-
-__global__ void _k_convolutionRows(uchar3 *d_src, uchar3 *d_dst, float *depth, int imageW, int imageH, int pitch, int pitch_depth, float focus_depth) {
-    __shared__ uchar3 s_data[ROW_TILE_HEIGHT][(ROW_BLOCK_WIDTH + 2 * ROW_TILE_WIDTH)];
-
+__global__ void convolveSeparableRowsKernel(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth) {
+    __shared__ unsigned char s_data[ROW_TILE_HEIGHT][(ROW_BLOCK_WIDTH + 2 * ROW_TILE_WIDTH)];
     int x = threadIdx.x, y = threadIdx.y;
     int x_image, y_image, x_s, y_s;
 
-    //Offset to the left halo edge
     x_image = blockIdx.x * ROW_BLOCK_WIDTH - ROW_TILE_WIDTH + x;
     y_image = blockIdx.y * ROW_BLOCK_HEIGHT + y;
-
     x_s = x; y_s = y;
-    s_data[y_s][x_s].x = x_image < 0 ? 0 : d_src[y_image * pitch + x_image].x;
-    s_data[y_s][x_s].y = x_image < 0 ? 0 : d_src[y_image * pitch + x_image].y;
-    s_data[y_s][x_s].z = x_image < 0 ? 0 : d_src[y_image * pitch + x_image].z;
-
+    s_data[y_s][x_s] = x_image < 0 ? 0 : d_src[y_image * pitch + x_image];
 
     for (int i = 1; i < (ROW_TILES_IN_BLOCK + 2); ++i) {
         x_s += ROW_TILE_WIDTH;
         x_image += ROW_TILE_WIDTH;
-        s_data[y_s][x_s].x = x_image >= imageW * 3 ? 0 : d_src[y_image * pitch + x_image].x;
-        s_data[y_s][x_s].y = x_image >= imageW * 3 ? 0 : d_src[y_image * pitch + x_image].y;
-        s_data[y_s][x_s].z = x_image >= imageW * 3 ? 0 : d_src[y_image * pitch + x_image].z;
-
+        s_data[y_s][x_s] = x_image >= image_width * 3 ? 0 : d_src[y_image * pitch + x_image];
     }
     __syncthreads();
 
@@ -103,26 +98,19 @@ __global__ void _k_convolutionRows(uchar3 *d_src, uchar3 *d_dst, float *depth, i
     x_s = ROW_TILE_WIDTH + x;
 
     for (int i = 0; i < ROW_TILES_IN_BLOCK; ++i) {
-        if (x_image < imageW * 3) {
-            int kernel_radius = (int)floor(10 * fabs(depth[y_image * pitch_depth / sizeof(float) + x_image / 3] - focus_depth));
+        if (x_image < image_width * 3) {
+            int kernel_radius = (int)floor(10 * fabs(d_depth_map[y_image * depth_map_pitch / sizeof(float) + x_image / 3] - focus_depth));
             if (kernel_radius > 0) {
-                float sum[3] = { 0, 0, 0 };
+                float sum = 0;
                 int kernel_start = kernel_radius * kernel_radius - 1;
                 int kernel_mid = kernel_start + kernel_radius;
                 for (int j = -kernel_radius; j <= kernel_radius; ++j) {
-                    sum[0] += (float)s_data[y_s][x_s + j * 3].x * c_kernel[kernel_mid + j];
-                    sum[1] += (float)s_data[y_s][x_s + j * 3].y * c_kernel[kernel_mid + j];
-                    sum[2] += (float)s_data[y_s][x_s + j * 3].z * c_kernel[kernel_mid + j];
+                    sum += (float)s_data[y_s][x_s + j * 3] * c_kernel[kernel_mid + j];
                 }
-                d_dst[y_image * pitch + x_image].x = (unsigned char)sum[0];
-                d_dst[y_image * pitch + x_image].y = (unsigned char)sum[1];
-                d_dst[y_image * pitch + x_image].z = (unsigned char)sum[2];
-
+                d_dst[y_image * pitch + x_image] = (unsigned char)sum;
             }
             else {
-                d_dst[y_image * pitch + x_image].x = s_data[y_s][x_s].x;
-                d_dst[y_image * pitch + x_image].y = s_data[y_s][x_s].y;
-                d_dst[y_image * pitch + x_image].z = s_data[y_s][x_s].z;
+                d_dst[y_image * pitch + x_image] = s_data[y_s][x_s];
             }
         }
         x_s += ROW_TILE_WIDTH;
@@ -130,7 +118,36 @@ __global__ void _k_convolutionRows(uchar3 *d_src, uchar3 *d_dst, float *depth, i
     }
 }
 
+ void GpuConvolveSeparableRows(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth) {
+    cudaEvent_t start, stop;
+    float time;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
+    int block_grid_width = (int)ceil((float)image_width * 3 / (ROW_TILES_IN_BLOCK * ROW_TILE_WIDTH));
+    int block_grid_height = (int)ceil((float)image_height / (ROW_TILE_HEIGHT));
+    printf("block_grid_width:%d block_grid_height:%d\n", block_grid_width, block_grid_height);
+    printf("image_width:%d image_height:%d\n", image_width, image_height);
+    dim3 blocks(block_grid_width, block_grid_height);
+    dim3 threads(ROW_TILE_WIDTH, ROW_TILE_HEIGHT);
+    cudaEventRecord(start, 0);
+
+    convolveSeparableRowsKernel << <blocks, threads >> > (
+        d_dst,
+        d_src,
+        d_depth_map,
+        image_width,
+        image_height,
+        pitch,
+        depth_map_pitch,
+        focus_depth
+        );
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+    printf("Time for the kernel: %f ms\n", time);
+
+}
 
 #define COL_TILE_WIDTH 16
 #define COL_TILE_HEIGHT 10
@@ -139,38 +156,30 @@ __global__ void _k_convolutionRows(uchar3 *d_src, uchar3 *d_dst, float *depth, i
 #define COL_BLOCK_WIDTH COL_TILE_WIDTH * COL_HTILES_IN_BLOCK
 #define COL_BLOCK_HEIGHT COL_TILE_HEIGHT * COL_VTILES_IN_BLOCK 
 
-__global__ void _k_convolutionColumns(uchar3 *d_dst, uchar3 *d_Src, float *depth, int imageW, int imageH, int pitch, int pitch_depth, float focus_depth) {
-    __shared__ uchar3 s_data[COL_BLOCK_HEIGHT + 2 * COL_TILE_HEIGHT][COL_BLOCK_WIDTH];
-
+__global__ void convolveSeparableColsKernel(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth) {
+    __shared__ unsigned char s_data[COL_BLOCK_HEIGHT + 2 * COL_TILE_HEIGHT][COL_BLOCK_WIDTH];
     int x = threadIdx.x, y = threadIdx.y;
     int x_image, y_image, x_s, y_s;
 
     x_image = (blockIdx.x * COL_BLOCK_WIDTH) + x;
     y_image = blockIdx.y * COL_BLOCK_HEIGHT - COL_TILE_HEIGHT + y;
     x_s = x; y_s = y;
-   
-    for (int k = 0; k < COL_HTILES_IN_BLOCK; ++k) {
-        if (x_image < imageW * 3) {
-            s_data[y_s][x_s].x = y_image < 0 ? 0 : d_Src[y_image * pitch + x_image].x;
-            s_data[y_s][x_s].y = y_image < 0 ? 0 : d_Src[y_image * pitch + x_image].y;
-            s_data[y_s][x_s].z = y_image < 0 ? 0 : d_Src[y_image * pitch + x_image].z;
 
+    for (int k = 0; k < COL_HTILES_IN_BLOCK; ++k) {
+        if (x_image < image_width * 3) {
+            s_data[y_s][x_s] = y_image < 0 ? 0 : d_src[y_image * pitch + x_image];
             x_image += COL_TILE_WIDTH;
             x_s += COL_TILE_WIDTH;
         }
     }
-
     for (int i = 1; i < COL_VTILES_IN_BLOCK + 2; ++i) {
         x_image = (blockIdx.x * COL_BLOCK_WIDTH) + x;
         x_s = x;
         y_s += COL_TILE_HEIGHT;
         y_image += COL_TILE_HEIGHT;
         for (int k = 0; k < COL_HTILES_IN_BLOCK; ++k) {
-            if (x_image < imageW * 3) {
-                s_data[y_s][x_s].x = y_image < imageH ? d_Src[y_image * pitch + x_image].x : 0;
-                s_data[y_s][x_s].y = y_image < imageH ? d_Src[y_image * pitch + x_image].y : 0;
-                s_data[y_s][x_s].z = y_image < imageH ? d_Src[y_image * pitch + x_image].z : 0;
-
+            if (x_image < image_width * 3) {
+                s_data[y_s][x_s] = y_image < image_height ? d_src[y_image * pitch + x_image] : 0;
                 x_image += COL_TILE_WIDTH;
                 x_s += COL_TILE_WIDTH;
             }
@@ -180,34 +189,25 @@ __global__ void _k_convolutionColumns(uchar3 *d_dst, uchar3 *d_Src, float *depth
     x_image = (blockIdx.x * COL_BLOCK_WIDTH) + x;
     x_s = x;
     for (int k = 0; k < COL_HTILES_IN_BLOCK; ++k) {
-        if (x_image < imageW * 3) {
+        if (x_image < image_width * 3) {
             y_image = blockIdx.y * COL_BLOCK_HEIGHT - COL_TILE_HEIGHT + y;
             y_s = y;
 
             for (int i = 0; i < COL_VTILES_IN_BLOCK; ++i) {
                 y_s += COL_TILE_HEIGHT;
                 y_image += COL_TILE_HEIGHT;
-                if (y_image < imageH) {
-                    int kernel_radius = (int)floor(10 * fabs(depth[y_image * pitch_depth / sizeof(float) + x_image / 3] - focus_depth));
+                if (y_image < image_height) {
+                    int kernel_radius = (int)floor(10 * fabs(d_depth_map[y_image * depth_map_pitch / sizeof(float) + x_image / 3] - focus_depth));
                     if (kernel_radius > 0) {
-                        float sum[3] = { 0,0,0 };
+                        float sum = 0;
                         int kernel_start = kernel_radius * kernel_radius - 1;
                         int kernel_mid = kernel_start + kernel_radius;
-                        for (int j = -kernel_radius; j <= kernel_radius; ++j) {
-                            sum[0] += (float)s_data[y_s + j][x_s].x * c_kernel[kernel_mid + j];
-                            sum[1] += (float)s_data[y_s + j][x_s].y * c_kernel[kernel_mid + j];
-                            sum[2] += (float)s_data[y_s + j][x_s].z * c_kernel[kernel_mid + j];
-                        }
-                        d_dst[y_image * pitch + x_image].x = (unsigned char)sum[0];
-                        d_dst[y_image * pitch + x_image].y = (unsigned char)sum[1];
-                        d_dst[y_image * pitch + x_image].z = (unsigned char)sum[2];
-
+                        for (int j = -kernel_radius; j <= kernel_radius; ++j)
+                            sum += (float)s_data[y_s + j][x_s] * c_kernel[kernel_mid + j];
+                        d_dst[y_image * pitch + x_image] = (unsigned char)sum;
                     }
-                    else {
-                        d_dst[y_image * pitch + x_image].x = s_data[y_s][x_s].x;
-                        d_dst[y_image * pitch + x_image].y = s_data[y_s][x_s].y;
-                        d_dst[y_image * pitch + x_image].z = s_data[y_s][x_s].z;
-                    }
+                    else
+                        d_dst[y_image * pitch + x_image] = s_data[y_s][x_s];
                 }
             }
         }
@@ -216,33 +216,39 @@ __global__ void _k_convolutionColumns(uchar3 *d_dst, uchar3 *d_Src, float *depth
     }
 }
 
+ void GpuConvolveSeparableCols(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth) {
+    cudaEvent_t start, stop;
+    float time;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
+    int block_grid_width = (int)ceil((float)image_width * 3 / (COL_TILE_WIDTH * COL_HTILES_IN_BLOCK));
+    int block_grid_height = (int)ceil((float)image_height / (COL_VTILES_IN_BLOCK * COL_TILE_HEIGHT));
+    printf("block_grid_width:%d block_grid_height:%d\n", block_grid_width, block_grid_height);
+    printf("image_width:%d image_height:%d\n", image_width, image_height);
+    dim3 blocks(block_grid_width, block_grid_height);
+    dim3 threads(COL_TILE_WIDTH, COL_TILE_HEIGHT);
+    cudaEventRecord(start, 0);
+    convolveSeparableColsKernel << <blocks, threads >> > (
+        d_dst,
+        d_src,
+        d_depth_map,
+        image_width,
+        image_height,
+        pitch,
+        depth_map_pitch,
+        focus_depth
+        );
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+    printf("Time for the kernel: %f ms\n", time);
+
+}
 
 int divUp(int a, int b)
 {
     return ((a % b) != 0) ? (a / b + 1) : (a / b);
-}
-
-
-void convolutionRows(uchar3* d_Dst, uchar3* d_Src, float* i_depth, int imageW, int imageH, size_t pitch, size_t depth_pitch, float focus_point)
-{
-    int block_grid_width = (int)ceil((float)imageW * 3 / (ROW_TILES_IN_BLOCK * ROW_TILE_WIDTH));
-    int block_grid_height = (int)ceil((float)imageH / (ROW_TILE_HEIGHT));
-    dim3 blocks(block_grid_width, block_grid_height);
-    dim3 threads(ROW_TILE_WIDTH, ROW_TILE_HEIGHT);
-    _k_convolutionRows << <blocks, threads >> > (d_Dst, d_Src, i_depth, imageW, imageH, imageW, depth_pitch, focus_point);
-}
-
-
-void convolutionColumns(uchar3* d_Dst, uchar3* d_Src, float* i_depth, int imageW, int imageH, size_t pitch, size_t depth_pitch, float focus_point)
-{
-    int block_grid_width = (int)ceil((float)imageW * 3 / (COL_TILE_WIDTH * COL_HTILES_IN_BLOCK));
-    int block_grid_height = (int)ceil((float)imageH / (COL_VTILES_IN_BLOCK * COL_TILE_HEIGHT));
-    printf("block_grid_width:%d block_grid_height:%d\n", block_grid_width, block_grid_height);
-    printf("image_width:%d image_height:%d\n", imageW, imageH);
-    dim3 blocks(block_grid_width, block_grid_height);
-    dim3 threads(COL_TILE_WIDTH, COL_TILE_HEIGHT);
-    _k_convolutionColumns << <blocks, threads >> > (d_Dst, d_Src, i_depth, imageW, imageH, imageW, depth_pitch, focus_point);
 }
 
 

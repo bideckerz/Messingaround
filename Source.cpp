@@ -13,11 +13,7 @@
 #include <fstream>
 #include <opencv2/cudaarithm.hpp>
 
-#define KERNEL_RADIUS  32
-#define RADIUS 32
-#define KERNEL_LENGTH_X(x) (2 * x + 1)
-#define MAX_KERNEL_LENGTH KERNEL_LENGTH(MAX_KERNEL_RADIUS)
-#define KERNEL_LENGTH (2 * KERNEL_RADIUS + 1)
+
 
 using namespace cv;
 using namespace std;
@@ -33,9 +29,12 @@ void depthProcess(cv::cuda::GpuMat& src, cv::cuda::GpuMat& dst, int dimX, int di
 
 void normal(const cv::cuda::PtrStepSzf src, cv::cuda::PtrStepSzf dst, int dimX, int dimY, int step, float min, float max);
 
-void convolutionRows(uchar3* d_Dst, uchar3* d_Src, float* i_depth, int imageW, int imageH, size_t pitch, size_t depth_pitch, float focus_point);
 
-void convolutionColumns(uchar3* d_Dst, uchar3* d_Src, float* i_depth, int imageW, int imageH, size_t pitch, size_t depth_pitch, float focus_point);
+void GpuConvolveSeparableRows(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth);
+void GpuConvolveSeparableCols(unsigned char* d_dst, unsigned char* d_src, float* d_depth_map, int image_width, int image_height, size_t pitch, size_t depth_map_pitch, float focus_depth);
+
+
+
 
 cv::Mat_<float> generateGaussianKernel1D(int kernelSize, int sigma)
 {
@@ -58,16 +57,6 @@ cv::Mat_<float> generateGaussianKernel1D(int kernelSize, int sigma)
     return h_kernel;
 }
 
-class DepthOfFieldRenderer {
-    vector<int> filter_sizes_;
-    float kDepthStep;
-public:
-    DepthOfFieldRenderer(float _depth_step);
-    ~DepthOfFieldRenderer();
-    
-    void RenderDoF(Point origin);
-    
-}; 
 
 
 
@@ -105,7 +94,7 @@ int main(int argc, char** argv)
     //
     //int border;
     
-    const int kernelSize = 2 * RADIUS + 1;
+    const int kernelSize = 2 * 4 + 1;
     int sigma = 11;
     int border;
     
@@ -141,21 +130,6 @@ int main(int argc, char** argv)
     }*/
 
 
-    vector<int> filter_sizes_;
-    for (int radius = 1; radius * 0.1 < 1.0; ++radius)
-        filter_sizes_.push_back(2 * radius + 1);
-    const char* empty;
-
-    vector<Mat> gaussianKernel;
-    vector<float*> h_kernel3;
-    for (int i = 0; i < filter_sizes_.size(); ++i) {
-        gaussianKernel.push_back(getGaussianKernel(filter_sizes_[i], -1, CV_32F));
-        h_kernel3.push_back(gaussianKernel[i].ptr<float>(0));
-        copyKernel(h_kernel3[i], i);
-    }
-    testKernel();
-
-    
 
     
     h_kernel1D = generateGaussianKernel1D(kernelSize, sigma);
@@ -185,9 +159,6 @@ int main(int argc, char** argv)
     Mat depthmapR(1920, 1080, CV_32FC1);
     Mat d_depthmapL(1920+border, 10800+border, CV_32FC1);
     Mat d_depthmapR(1920+border, 1080+border, CV_32FC1);
-
-    //print(lft);
-    //depthmap = (focalLenght * baseline / (lft / scale ));
     
     d_pfml.upload(lftp);
     d_pfmr.upload(rgtp);
@@ -208,15 +179,50 @@ int main(int argc, char** argv)
     d_respfml.download(depthmapL);
     d_respfmr.download(depthmapR);   
 
-    uchar3* lftu, * rgtu, * h_outputL;
-    uchar3* d_lftu, * d_rgtu, * d_outputL, *d_bufferImg;
+    unsigned char* lftu, * rgtu, * h_outputL, * h_outputR;
+    unsigned char* d_lftu, * d_rgtu, * d_outputL, *d_bufferImgL, * d_outputR, * d_bufferImgR;
     float* h_depthmapL, * d_depthL;
+    float* h_depthmapR, * d_depthR;
 
     while (!lft.isContinuous())
         lft = lft.clone();
 
-    lftu = (uchar3*)lft.ptr<Vec3b>(0);
-    rgtu = (uchar3*)rgt.ptr<Vec3b>(0);
+    while (!rgt.isContinuous())
+        rgt = rgt.clone();
+
+
+    float kDepthStep = 0.02;
+    vector<int> filter_sizes_;
+    for (int radius = 1; radius * kDepthStep < 1.0; ++radius)
+        filter_sizes_.push_back(2 * radius + 1);
+
+
+    vector<Mat> gaussianKernel;
+    vector<float*> h_kernel3;
+    for (int i = 0; i < filter_sizes_.size(); ++i) {
+        gaussianKernel.push_back(getGaussianKernel(filter_sizes_[i], -1, CV_32F));
+        h_kernel3.push_back(gaussianKernel[i].ptr<float>(0));
+        copyKernel(h_kernel3[i], i);
+    }
+
+    printf("\nAllocating memory on GPU ...\n\n");
+
+    size_t pitch;
+
+    lftu = (unsigned char*)lft.ptr<Vec3b>(0);
+    rgtu = (unsigned char*)rgt.ptr<Vec3b>(0);
+
+
+    cudaMallocPitch(&d_lftu, &pitch, width * sizeof(Vec3b), height);
+    cudaMemcpy2D(d_lftu, pitch, lftu, width * sizeof(Vec3b), width * sizeof(Vec3b), height, cudaMemcpyHostToDevice);
+
+    cudaMallocPitch(&d_rgtu, &pitch, width * sizeof(Vec3b), height);
+    cudaMemcpy2D(d_rgtu, pitch, rgtu, width * sizeof(Vec3b), width * sizeof(Vec3b), height, cudaMemcpyHostToDevice);
+
+
+
+
+
 
     double minl, maxl;
     cv::minMaxLoc(depthmapL, &minl, &maxl);
@@ -255,32 +261,55 @@ int main(int argc, char** argv)
 
 
 
-    size_t pitch;
-    cudaMallocPitch(&d_lftu, &pitch, width * sizeof(Vec3b), height);
-    cudaMemcpy2D(d_lftu, pitch, lftu, width * sizeof(Vec3b), width * sizeof(Vec3b), height, cudaMemcpyHostToDevice);
+
 
     size_t depth_pitch;
     h_depthmapL = nor_depthmapL.ptr<float>(0);
+    h_depthmapR = nor_depthmapR.ptr<float>(0);
 
     cudaMallocPitch(&d_depthL, &depth_pitch, width * sizeof(float), height);
     cudaMemcpy2D(d_depthL, depth_pitch, h_depthmapL, width * sizeof(float), width * sizeof(float), height, cudaMemcpyHostToDevice);
 
+    cudaMallocPitch(&d_depthR, &depth_pitch, width * sizeof(float), height);
+    cudaMemcpy2D(d_depthR, depth_pitch, h_depthmapR, width * sizeof(float), width * sizeof(float), height, cudaMemcpyHostToDevice);
 
 
-    h_outputL = (uchar3*)malloc(width * height * sizeof(Vec3b));
+
+    h_outputL = (unsigned char*)malloc(width * height * sizeof(Vec3b));
     cudaMalloc((void**)&d_outputL, pitch * height);
-    cout <<"pitch "<< pitch<<endl;
-    cudaMemset(d_outputL, 0, pitch * height);
 
-    cudaMalloc((void**)&d_bufferImg, pitch * height);
-    float depth_of_focus = nor_depthmapL.at<float>(1000,1000);
+    h_outputR = (unsigned char*)malloc(width * height * sizeof(Vec3b));
+    cudaMalloc((void**)&d_outputR, pitch * height);
+    
+    cudaMemset(d_outputL, 0, pitch * height);
+    cudaMemset(d_outputR, 0, pitch * height);
+
+    cudaMalloc((void**)&d_bufferImgL, pitch * height);
+    cudaMalloc((void**)&d_bufferImgR, pitch * height);
+
+    //float depth_of_focus = nor_depthmapL.at<float>(1000,101);
+    float depth_of_focus = 0.8;
+    cout << "depth focus" << depth_of_focus << endl;
     
 
-    convolutionRows(lftu, d_bufferImg, d_depthL, width, height, pitch, depth_pitch, depth_of_focus);
-    convolutionColumns(d_bufferImg, d_outputL, d_depthL, width, height,pitch, depth_pitch , depth_of_focus);
+    cudaDeviceSynchronize();
+    GpuConvolveSeparableRows(d_bufferImgL, d_lftu, d_depthL, width, height, pitch, depth_pitch, depth_of_focus);
+    GpuConvolveSeparableRows(d_bufferImgR, d_rgtu, d_depthR, width, height, pitch, depth_pitch, depth_of_focus);
+
+
+    printf("Running column convolution on GPU ... \n");
+    GpuConvolveSeparableCols(d_outputL, d_bufferImgL, d_depthL, width, height, pitch, depth_pitch, depth_of_focus);
+    GpuConvolveSeparableCols(d_outputR, d_bufferImgR, d_depthR, width, height, pitch, depth_pitch, depth_of_focus);
+    cudaDeviceSynchronize();
+
+    printf("\nCopying results ...\n\n");
     
     cudaMemcpy2D(h_outputL, width * sizeof(Vec3b), d_outputL, pitch, width * sizeof(Vec3b), height, cudaMemcpyDeviceToHost);
-    Mat output_image_color(lft.size(), lft.type(), h_outputL);
+    cudaMemcpy2D(h_outputR, width * sizeof(Vec3b), d_outputR, pitch, width * sizeof(Vec3b), height, cudaMemcpyDeviceToHost);
+
+    Mat output_image_colorL(lft.size(), lft.type(), h_outputL);
+    Mat output_image_colorR(lft.size(), lft.type(), h_outputR);
+
    
 
     //gaussianSep(d_left, d_tmp_imgl, d_depthl, d_kernel1D, 1,0.2);
@@ -294,21 +323,23 @@ int main(int argc, char** argv)
 
     cv::Mat_<cv::Vec3b> h_resultl;
     //d_resultl.download(h_resultl);
-    //cv::Mat_<cv::Vec3b> h_resultr;
+    cv::Mat_<cv::Vec3b> h_resultr;
     //d_resultr.download(h_resultr);
-    h_resultl = output_image_color;
+    h_resultl = output_image_colorL;
+    h_resultr = output_image_colorR;
+
     
     //cout << depthmapL;
-    //imshow("disp1", lft);
-    //imshow("disp2", rgt);
-    //imshow("depthmapL",depthmapL);
+    imshow("disp1", lft);
+    imshow("disp2", rgt);
+    imshow("depthmapL",depthmapL);
     //imwrite("C:\\Users\\acevedo\\Documents\\Visual Studio 2019\\Varjo\\OpenCV\\results\\depthl.jpg", depthmapL);
     //imshow("depthmapR", depthmapR);
     //imwrite("C:\\Users\\acevedo\\Documents\\Visual Studio 2019\\Varjo\\OpenCV\\results\\depthr.jpg", depthmapR);
     
     imshow("resultl", h_resultl);
     //imwrite("C:\\Users\\acevedo\\Documents\\Visual Studio 2019\\Varjo\\OpenCV\\results\\depthblurl.png", h_resultl);
-    //imshow("resultr", h_resultr);
+    imshow("resultr", h_resultr);
     //imwrite("C:\\Users\\acevedo\\Documents\\Visual Studio 2019\\Varjo\\OpenCV\\results\\depthblurr.png", h_resultr);
 
 
